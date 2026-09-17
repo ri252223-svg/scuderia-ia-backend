@@ -1,0 +1,21 @@
+{
+  "name": "scuderia-ia-backend",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Backend real da Scuderia IA (Fase 5) — Postgres, autenticação com hash de senha, papéis owner/staff, isolamento multiempresa via Row Level Security. WhatsApp e Mercado Pago continuam simulados.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "dotenv": "^16.4.5",
+    "pg": "^8.13.0",
+    "bcrypt": "^5.1.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
