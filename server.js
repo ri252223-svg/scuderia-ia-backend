@@ -10,6 +10,7 @@ const { createMercadoPagoRouter, createPixCharge } = require('./routes/mercadopa
 const createActionsRouter = require('./routes/actions');
 const createAuthRouter = require('./routes/auth');
 const createDataRouter = require('./routes/data');
+const createMenuRouter = require('./routes/menu');
 
 const app = express();
 
@@ -53,6 +54,7 @@ app.use('/webhooks/whatsapp', createWhatsappRouter({ parseCommandChain, CONFIRM_
 app.use('/webhooks/mercadopago', createMercadoPagoRouter({ db }));
 app.use('/api/actions', createActionsRouter({ runAction, REQUIRES_OWNER, db }));
 app.use('/api/data', createDataRouter({ db }));
+app.use('/menu', createMenuRouter({ db }));
 
 app.get('/health', (req, res) => res.json({ ok: true }));
 
