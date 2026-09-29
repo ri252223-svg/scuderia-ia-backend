@@ -1,627 +1,182 @@
-const { Pool } = require('pg');
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 10
-});
+const express = require('express');
 
 /**
- * Toda operação que pertence a uma empresa passa por aqui. Abre uma
- * transação, define o "quem sou eu" pro Postgres (que o RLS usa pra
- * filtrar), roda a função recebida, e fecha. Se o business_id nunca
- * for setado, o RLS bloqueia tudo — então esquecer de usar isso é uma
- * falha segura (nada retorna), não uma falha aberta.
+ * Rotas do cardápio digital do PONTO DE VISTA DO CLIENTE — nunca do dono.
+ * Por isso não passam por requireAuth: o cliente não tem conta, não faz
+ * login, só escaneia o QR da mesa. O "token" de sessão aqui NÃO é um JWT,
+ * é só um identificador aleatório opaco (ver migrations/004) que o
+ * navegador do cliente guarda em localStorage — ele nunca carrega
+ * business_id nem nenhum dado sensível.
+ *
+ * GET  /menu/:qr_token       -> escaneou o QR agora: cria sessão nova
+ * GET  /menu/sessao/:token   -> já tinha sessão (recarregou a página)
+ *
+ * Carrinho (sempre amarrado à sessão; preço vem do banco, nunca do cliente):
+ * GET    /menu/sessao/:token/carrinho
+ * POST   /menu/sessao/:token/carrinho           { produto_id, quantidade, observacao }
+ * PATCH  /menu/sessao/:token/carrinho/:itemId   { quantidade }
+ * DELETE /menu/sessao/:token/carrinho/:itemId
+ *
+ * Pedido:
+ * POST   /menu/sessao/:token/pedido             { observacao }  -> confirma o carrinho
+ * GET    /menu/sessao/:token/pedidos            -> pedidos desta sessão + status
  */
-async function withTenant(businessId, fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    // SET não aceita parâmetro ligado ($1) em Postgres — set_config() aceita.
-    // O "true" no terceiro argumento é o equivalente a LOCAL (só a transação atual).
-    await client.query(`SELECT set_config('app.current_business_id', $1, true)`, [businessId]);
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
+module.exports = function createMenuRouter({ db }) {
+  const router = express.Router();
+
+  async function montarCardapio(businessId) {
+    const [categorias, produtos] = await Promise.all([
+      db.listMenuCategories(businessId),
+      db.listMenuProducts(businessId)
+    ]);
+    // Cliente só pode ver pratos disponíveis — indisponível é informação
+    // interna do dono, não da vitrine.
+    return { categorias, produtos: produtos.filter(p => p.disponivel) };
   }
-}
 
-/* Só pra duas situações legítimas sem tenant ainda definido:
-   1) login — precisa achar o usuário pelo e-mail antes de saber a empresa;
-   2) criar uma empresa nova — o próprio código define o business_id
-      (gerado em JS) e abre o tenant com ELE antes de inserir, então na
-      prática toda escrita real ainda acontece com o contexto certo. */
-async function withoutTenant(fn) {
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await fn(client);
-    await client.query('COMMIT');
-    return result;
-  } catch (e) {
-    await client.query('ROLLBACK');
-    throw e;
-  } finally {
-    client.release();
-  }
-}
-
-function rowToService(r){ return r && { id:r.id, business_id:r.business_id, nome:r.nome, preco:Number(r.preco), duracao_min:r.duracao_min }; }
-function rowToAutomation(r){ return r && { id:r.id, business_id:r.business_id, label:r.label, desc:r.descricao, on:r.ativo }; }
-function rowToMenuCategory(r){ return r && { id:r.id, business_id:r.business_id, nome:r.nome, ordem:r.ordem }; }
-function rowToMenuProduct(r){
-  return r && {
-    id: r.id, business_id: r.business_id, category_id: r.category_id,
-    nome: r.nome, descricao: r.descricao, ingredientes: r.ingredientes,
-    preco: Number(r.preco), disponivel: r.disponivel, foto: r.foto,
-    largura_cm: r.largura_cm === null ? null : Number(r.largura_cm),
-    altura_cm: r.altura_cm === null ? null : Number(r.altura_cm),
-    profundidade_cm: r.profundidade_cm === null ? null : Number(r.profundidade_cm)
-  };
-}
-function rowToMenuTable(r){ return r && { id:r.id, business_id:r.business_id, nome:r.nome, qr_token:r.qr_token, ativa:r.ativa }; }
-function rowToCartItem(r){
-  return r && {
-    id: r.id, product_id: r.product_id, nome: r.nome, foto: r.foto,
-    preco_unitario: Number(r.preco), disponivel: r.disponivel,
-    quantidade: r.quantidade, observacao: r.observacao,
-    subtotal: Math.round(Number(r.preco) * r.quantidade * 100) / 100
-  };
-}
-function rowToMenuSession(r){ return r && { id:r.id, business_id:r.business_id, mesa_id:r.mesa_id, token:r.token, criado_em:r.criado_em, ultima_atividade:r.ultima_atividade }; }
-function rowToAppointment(r){ return r && { id:r.id, business_id:r.business_id, customer_id:r.customer_id, service_id:r.service_id, professional_id:r.professional_id, data: (r.data instanceof Date ? r.data.toISOString().slice(0,10) : r.data), hora: (r.hora||'').slice(0,5), status:r.status }; }
-
-module.exports = {
-  pool, withTenant, withoutTenant,
-
-  // ---- businesses / auth ----
-  async createBusiness(businessId, fields = {}) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into businesses (id, nome, responsavel_nome, whatsapp)
-         values ($1,$2,$3,$4) returning *`,
-        [businessId, fields.nome || '', fields.responsavel_nome || '', fields.whatsapp || '']
-      );
-      return r.rows[0];
-    });
-  },
-  async findBusinessById(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from businesses where id = $1`, [businessId]);
-      return r.rows[0] || null;
-    });
-  },
-  async updateBusiness(businessId, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 2}`).join(', ');
-      const r = await c.query(`update businesses set ${set} where id = $1 returning *`, [businessId, ...cols.map(k => changes[k])]);
-      return r.rows[0];
-    });
-  },
-  async createUser({ businessId, nome, email, senhaHash, role }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into users (business_id, nome, email, role, senha_hash)
-         values ($1,$2,$3,$4,$5) returning id, business_id, nome, email, role, created_at`,
-        [businessId, nome, email.toLowerCase(), role, senhaHash]
-      );
-      return r.rows[0];
-    });
-  },
-  async findUserByEmail(email) {
-    return withoutTenant(async (c) => {
-      const r = await c.query(`select * from users where email = $1`, [email.toLowerCase()]);
-      return r.rows[0] || null;
-    });
-  },
-  async listUsersByBusiness(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select id, nome, email, role, created_at from users where business_id = $1 order by created_at`, [businessId]);
-      return r.rows;
-    });
-  },
-
-  // ---- customers ----
-  async createCustomer(businessId, { nome, whatsapp }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into customers (business_id, nome, whatsapp) values ($1,$2,$3) returning *`,
-        [businessId, nome, whatsapp || '']
-      );
-      return r.rows[0];
-    });
-  },
-  async editCustomer(businessId, id, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 3}`).join(', ');
-      const r = await c.query(`update customers set ${set} where id = $1 and business_id = $2 returning *`, [id, businessId, ...cols.map(k => changes[k])]);
-      return r.rows[0] || null;
-    });
-  },
-  async findCustomerByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `select * from customers where business_id = $1 and nome ilike '%'||$2||'%' order by criado_em desc limit 1`,
-        [businessId, nome]
-      );
-      return r.rows[0] || null;
-    });
-  },
-
-  // ---- services ----
-  async createService(businessId, { nome, preco, duracao_min }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into services (business_id, nome, preco, duracao_min) values ($1,$2,$3,$4) returning *`,
-        [businessId, nome, preco || 0, duracao_min || 30]
-      );
-      return rowToService(r.rows[0]);
-    });
-  },
-  async editService(businessId, id, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 3}`).join(', ');
-      const r = await c.query(`update services set ${set} where id = $1 and business_id = $2 returning *`, [id, businessId, ...cols.map(k => changes[k])]);
-      return rowToService(r.rows[0]);
-    });
-  },
-  async removeService(businessId, id) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`delete from services where id = $1 and business_id = $2 returning *`, [id, businessId]);
-      return rowToService(r.rows[0]);
-    });
-  },
-  async findServiceByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from services where business_id = $1 and nome ilike '%'||$2||'%' limit 1`, [businessId, nome]);
-      return rowToService(r.rows[0]);
-    });
-  },
-  async listServices(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from services where business_id = $1 order by nome`, [businessId]);
-      return r.rows.map(rowToService);
-    });
-  },
-
-  // ---- professionals ----
-  async createProfessional(businessId, { nome }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`insert into professionals (business_id, nome) values ($1,$2) returning *`, [businessId, nome]);
-      return r.rows[0];
-    });
-  },
-  async editProfessional(businessId, id, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 3}`).join(', ');
-      const r = await c.query(`update professionals set ${set} where id = $1 and business_id = $2 returning *`, [id, businessId, ...cols.map(k => changes[k])]);
-      return r.rows[0] || null;
-    });
-  },
-  async removeProfessional(businessId, id) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`delete from professionals where id = $1 and business_id = $2 returning *`, [id, businessId]);
-      return r.rows[0] || null;
-    });
-  },
-  async findProfessionalByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from professionals where business_id = $1 and nome ilike '%'||$2||'%' limit 1`, [businessId, nome]);
-      return r.rows[0] || null;
-    });
-  },
-
-  // ---- appointments ----
-  async createAppointment(businessId, { customer_id, service_id, professional_id, data, hora }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into appointments (business_id, customer_id, service_id, professional_id, data, hora)
-         values ($1,$2,$3,$4,$5,$6) returning *`,
-        [businessId, customer_id, service_id, professional_id || null, data, hora]
-      );
-      return rowToAppointment(r.rows[0]);
-    });
-  },
-  async listAppointments(businessId, { data, status } = {}) {
-    return withTenant(businessId, async (c) => {
-      const conds = ['business_id = $1'];
-      const params = [businessId];
-      if (data) { params.push(data); conds.push(`data = $${params.length}`); }
-      if (status) { params.push(status); conds.push(`status = $${params.length}`); }
-      const r = await c.query(`select * from appointments where ${conds.join(' and ')} order by data, hora`, params);
-      return r.rows.map(rowToAppointment);
-    });
-  },
-  async findActiveAppointmentByCustomer(businessId, customerId, filters = {}) {
-    return withTenant(businessId, async (c) => {
-      const conds = ['business_id = $1', 'customer_id = $2', `status = 'confirmado'`];
-      const params = [businessId, customerId];
-      if (filters.hora) { params.push(filters.hora); conds.push(`hora = $${params.length}`); }
-      if (filters.data) { params.push(filters.data); conds.push(`data = $${params.length}`); }
-      const r = await c.query(`select * from appointments where ${conds.join(' and ')} order by data, hora limit 1`, params);
-      return rowToAppointment(r.rows[0]);
-    });
-  },
-  async updateAppointment(businessId, id, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 3}`).join(', ');
-      const r = await c.query(`update appointments set ${set} where id = $1 and business_id = $2 returning *`, [id, businessId, ...cols.map(k => changes[k])]);
-      return rowToAppointment(r.rows[0]);
-    });
-  },
-
-  // ---- automations ----
-  async createAutomation(businessId, { label, desc }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into automations (business_id, label, descricao, ativo) values ($1,$2,$3,true) returning *`,
-        [businessId, label, desc || 'Criada por comando']
-      );
-      return rowToAutomation(r.rows[0]);
-    });
-  },
-  async updateAutomation(businessId, id, changes) {
-    // changes usa os nomes "de fora" (label, desc, on) — traduz pras
-    // colunas reais da tabela (descricao, ativo) antes do update.
-    const colMap = { label: 'label', desc: 'descricao', on: 'ativo' };
-    const cols = Object.keys(changes).filter(k => colMap[k]);
-    if (cols.length === 0) return null;
-    return withTenant(businessId, async (c) => {
-      const set = cols.map((k, i) => `${colMap[k]} = $${i + 3}`).join(', ');
-      const r = await c.query(`update automations set ${set} where id = $1 and business_id = $2 returning *`, [id, businessId, ...cols.map(k => changes[k])]);
-      return rowToAutomation(r.rows[0]);
-    });
-  },
-  async listAutomations(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from automations where business_id = $1 order by label`, [businessId]);
-      return r.rows.map(rowToAutomation);
-    });
-  },
-
-  // ---- payments ----
-  async createPayment(businessId, payment) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into payments (business_id, customer_id, valor, status, external_id, pix_copia_cola)
-         values ($1,$2,$3,'pendente',$4,$5) returning *`,
-        [businessId, payment.customer_id, payment.valor, payment.external_id || null, payment.pix_copia_cola || null]
-      );
-      return r.rows[0];
-    });
-  },
-  async updatePaymentStatus(externalId, status) {
-    return withoutTenant(async (c) => {
-      const r = await c.query(`update payments set status = $2 where external_id = $1 returning *`, [externalId, status]);
-      return r.rows[0] || null;
-    });
-  },
-  // Usado só pelo webhook do Mercado Pago: nesse momento ainda não
-  // sabemos de qual empresa é o pagamento (só temos o id da cobrança),
-  // então essa consulta roda sem tenant, só pra descobrir o business_id
-  // — depois disso, toda leitura/escrita adicional já usa withTenant normalmente.
-  async findPaymentByExternalId(externalId) {
-    return withoutTenant(async (c) => {
-      const r = await c.query(`select * from payments where external_id = $1`, [externalId]);
-      return r.rows[0] || null;
-    });
-  },
-  async findLatestPaymentByCustomer(businessId, customerId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `select * from payments where business_id = $1 and customer_id = $2 order by criado_em desc limit 1`,
-        [businessId, customerId]
-      );
-      return r.rows[0] || null;
-    });
-  },
-
-  // ---- assistant_actions (auditoria) ----
-  async logAction(entry) {
-    return withTenant(entry.business_id, async (c) => {
-      const r = await c.query(
-        `insert into assistant_actions (business_id, user_id, origem, comando, acao, params, status, mensagem)
-         values ($1,$2,$3,$4,$5,$6,$7,$8) returning *`,
-        [entry.business_id, entry.user_id || null, entry.origem, entry.comando, entry.acao, JSON.stringify(entry.params || {}), entry.status, entry.mensagem]
-      );
-      return r.rows[0];
-    });
-  },
-  async listActions(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from assistant_actions where business_id = $1 order by "timestamp" desc limit 100`, [businessId]);
-      return r.rows;
-    });
-  },
-
-  // ---- Fase de IA, item 2: usado SÓ pelo agente (lib/agent.js) para
-  // checar ambiguidade antes de propor uma ação — ex: existem 2 "João"?
-  // Não é uma ACTION registrada (não passa por runAction/REQUIRES_OWNER),
-  // é só leitura, não muda nada. findCustomerByName acima continua
-  // intocada e é o que as ações existentes (criar_agendamento etc.)
-  // continuam usando.
-  async listCustomersByName(businessId, nome, limit = 5) {
-    if (!nome) return [];
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `select * from customers where business_id = $1 and nome ilike '%'||$2||'%' order by criado_em desc limit $3`,
-        [businessId, nome, limit]
-      );
-      return r.rows;
-    });
-  },
-
-  // ---- usadas pelas telas administrativas (Dashboard/Clientes/Equipe) ----
-  // listagem completa, sem filtro de nome — diferente de listCustomersByName
-  // acima, que é só pra checagem de ambiguidade da IA.
-  async listCustomers(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from customers where business_id = $1 order by nome`, [businessId]);
-      return r.rows;
-    });
-  },
-  async listProfessionals(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from professionals where business_id = $1 order by nome`, [businessId]);
-      return r.rows;
-    });
-  },
-
-  // ---- Conexão do Mercado Pago por empresa (modelo marketplace/OAuth) ----
-  // Reaproveita a coluna "integracoes" (jsonb) que já existia desde a
-  // primeira migration — não precisou de tabela nova nem migration nova.
-  async getBusinessIntegracoes(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select integracoes from businesses where id = $1`, [businessId]);
-      return (r.rows[0] && r.rows[0].integracoes) || {};
-    });
-  },
-  async saveMercadoPagoConnection(businessId, { access_token, refresh_token, mp_user_id, public_key }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `update businesses set integracoes = jsonb_set(
-           coalesce(integracoes, '{}'::jsonb),
-           '{mercado_pago}',
-           $2::jsonb,
-           true
-         ) where id = $1 returning integracoes`,
-        [businessId, JSON.stringify({
-          conectado: true, access_token, refresh_token, mp_user_id, public_key,
-          conectado_em: new Date().toISOString()
-        })]
-      );
-      return r.rows[0] && r.rows[0].integracoes;
-    });
-  },
-  async disconnectMercadoPago(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `update businesses set integracoes = jsonb_set(
-           coalesce(integracoes, '{}'::jsonb), '{mercado_pago}', $2::jsonb, true
-         ) where id = $1 returning integracoes`,
-        [businessId, JSON.stringify({ conectado: false })]
-      );
-      return r.rows[0] && r.rows[0].integracoes;
-    });
-  },
-
-  // ---- menu (cardápio digital / SIKY MENU) ----
-  async createMenuCategory(businessId, { nome, ordem }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into menu_categories (business_id, nome, ordem) values ($1,$2,$3) returning *`,
-        [businessId, nome, ordem || 0]
-      );
-      return rowToMenuCategory(r.rows[0]);
-    });
-  },
-  async findMenuCategoryByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_categories where business_id = $1 and nome ilike '%'||$2||'%' limit 1`, [businessId, nome]);
-      return rowToMenuCategory(r.rows[0]);
-    });
-  },
-  async listMenuCategories(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_categories where business_id = $1 order by ordem, nome`, [businessId]);
-      return r.rows.map(rowToMenuCategory);
-    });
-  },
-
-  async createMenuProduct(businessId, { category_id, nome, descricao, ingredientes, preco, foto, largura_cm, altura_cm, profundidade_cm }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `insert into menu_products
-           (business_id, category_id, nome, descricao, ingredientes, preco, foto, largura_cm, altura_cm, profundidade_cm)
-         values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) returning *`,
-        [businessId, category_id || null, nome, descricao || '', ingredientes || '', preco || 0, foto || null,
-         largura_cm ?? null, altura_cm ?? null, profundidade_cm ?? null]
-      );
-      return rowToMenuProduct(r.rows[0]);
-    });
-  },
-  async editMenuProduct(businessId, id, changes) {
-    return withTenant(businessId, async (c) => {
-      const cols = Object.keys(changes);
-      if (cols.length === 0) return null;
-      const set = cols.map((k, i) => `${k} = $${i + 3}`).join(', ');
-      const r = await c.query(
-        `update menu_products set ${set} where id = $1 and business_id = $2 returning *`,
-        [id, businessId, ...cols.map(k => changes[k])]
-      );
-      return rowToMenuProduct(r.rows[0]);
-    });
-  },
-  async removeMenuProduct(businessId, id) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`delete from menu_products where id = $1 and business_id = $2 returning *`, [id, businessId]);
-      return rowToMenuProduct(r.rows[0]);
-    });
-  },
-  async findMenuProductByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_products where business_id = $1 and nome ilike '%'||$2||'%' limit 1`, [businessId, nome]);
-      return rowToMenuProduct(r.rows[0]);
-    });
-  },
-  async listMenuProducts(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `select p.*, cat.nome as categoria_nome
-           from menu_products p
-           left join menu_categories cat on cat.id = p.category_id
-          where p.business_id = $1
-          order by cat.ordem nulls last, p.nome`,
-        [businessId]
-      );
-      return r.rows.map(row => Object.assign(rowToMenuProduct(row), { categoria_nome: row.categoria_nome || null }));
-    });
-  },
-
-  async createMenuTable(businessId, { nome }) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`insert into menu_tables (business_id, nome) values ($1,$2) returning *`, [businessId, nome]);
-      return rowToMenuTable(r.rows[0]);
-    });
-  },
-  async findMenuTableByName(businessId, nome) {
-    if (!nome) return null;
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_tables where business_id = $1 and nome ilike '%'||$2||'%' limit 1`, [businessId, nome]);
-      return rowToMenuTable(r.rows[0]);
-    });
-  },
-  async setMenuTableAtiva(businessId, id, ativa) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`update menu_tables set ativa = $3 where id = $1 and business_id = $2 returning *`, [id, businessId, ativa]);
-      return rowToMenuTable(r.rows[0]);
-    });
-  },
-  async listMenuTables(businessId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_tables where business_id = $1 order by nome`, [businessId]);
-      return r.rows.map(rowToMenuTable);
-    });
-  },
-  async findMenuTableByToken(qrToken) {
-    // Único caso de leitura de menu_tables sem tenant definido: o cliente
-    // chega com só o qr_token (sem saber a que empresa a mesa pertence),
-    // exatamente como o login localiza o usuário pelo e-mail antes de
-    // saber a empresa. A sessão do cliente (próxima etapa) é quem passa
-    // a abrir o tenant certo a partir do business_id que ESTA consulta
-    // devolve — nunca aceito de fora.
-    return withoutTenant(async (c) => {
-      const r = await c.query(`select * from menu_tables where qr_token = $1 and ativa = true`, [qrToken]);
-      return rowToMenuTable(r.rows[0]);
-    });
-  },
-
-  // ---- sessão anônima do cliente (SIKY MENU) ----
-  async createMenuSession(businessId, mesaId) {
-    // Mesmo caso do findMenuTableByToken: quem cria a sessão é o cliente
-    // anônimo escaneando o QR, então o business_id vem de dentro da própria
-    // função (já resolvido pelo qr_token um passo antes), nunca de fora.
-    return withoutTenant(async (c) => {
-      const r = await c.query(
-        `insert into menu_sessions (business_id, mesa_id) values ($1,$2) returning *`,
-        [businessId, mesaId]
-      );
-      return rowToMenuSession(r.rows[0]);
-    });
-  },
-  async findMenuSessionByToken(token) {
-    if (!token) return null;
-    return withoutTenant(async (c) => {
-      const r = await c.query(`select * from menu_sessions where token = $1`, [token]);
-      return rowToMenuSession(r.rows[0]);
-    });
-  },
-  async touchMenuSession(token) {
-    return withoutTenant(async (c) => {
-      const r = await c.query(
-        `update menu_sessions set ultima_atividade = now() where token = $1 returning *`,
-        [token]
-      );
-      return rowToMenuSession(r.rows[0]);
-    });
-  },
-
-  // ---- carrinho do cliente (SIKY MENU) ----
-  // Sempre chamadas com o business_id/session_id vindos da SESSÃO já validada
-  // pelo servidor — nunca de dados enviados pelo cliente.
-  async getMenuProductById(businessId, id) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`select * from menu_products where id = $1 and business_id = $2`, [id, businessId]);
-      return rowToMenuProduct(r.rows[0]);
-    });
-  },
-  async addCartItem(businessId, sessionId, { productId, quantidade, observacao }) {
-    return withTenant(businessId, async (c) => {
-      // Mesmo prato + mesma observação = soma na linha existente.
-      const ex = await c.query(
-        `select id, quantidade from menu_cart_items
-          where session_id = $1 and product_id = $2 and observacao = $3`,
-        [sessionId, productId, observacao]
-      );
-      if (ex.rows[0]) {
-        const nova = Math.min(50, ex.rows[0].quantidade + quantidade);
-        await c.query(`update menu_cart_items set quantidade = $2 where id = $1`, [ex.rows[0].id, nova]);
-        return ex.rows[0].id;
+  router.get('/:qrToken', async (req, res, next) => {
+    try {
+      const mesa = await db.findMenuTableByToken(req.params.qrToken);
+      if (!mesa) {
+        return res.status(404).json({ ok: false, mensagem: 'Mesa não encontrada ou inativa. Chame o atendimento.' });
       }
-      const r = await c.query(
-        `insert into menu_cart_items (business_id, session_id, product_id, quantidade, observacao)
-         values ($1,$2,$3,$4,$5) returning id`,
-        [businessId, sessionId, productId, quantidade, observacao]
-      );
-      return r.rows[0].id;
-    });
-  },
-  async listCartItems(businessId, sessionId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `select i.id, i.product_id, i.quantidade, i.observacao,
-                p.nome, p.foto, p.preco, p.disponivel
-           from menu_cart_items i
-           join menu_products p on p.id = i.product_id
-          where i.session_id = $1
-          order by i.criado_em`,
-        [sessionId]
-      );
-      return r.rows.map(rowToCartItem);
-    });
-  },
-  async setCartItemQuantity(businessId, sessionId, itemId, quantidade) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(
-        `update menu_cart_items set quantidade = $3 where id = $1 and session_id = $2 returning id`,
-        [itemId, sessionId, quantidade]
-      );
-      return !!r.rows[0];
-    });
-  },
-  async removeCartItem(businessId, sessionId, itemId) {
-    return withTenant(businessId, async (c) => {
-      const r = await c.query(`delete from menu_cart_items where id = $1 and session_id = $2 returning id`, [itemId, sessionId]);
-      return !!r.rows[0];
-    });
+      const sessao = await db.createMenuSession(mesa.business_id, mesa.id);
+      const { categorias, produtos } = await montarCardapio(mesa.business_id);
+      res.json({
+        ok: true,
+        sessao_token: sessao.token,
+        mesa: { id: mesa.id, nome: mesa.nome },
+        categorias,
+        produtos
+      });
+    } catch (e) { next(e); }
+  });
+
+  router.get('/sessao/:token', async (req, res, next) => {
+    try {
+      const sessao = await db.findMenuSessionByToken(req.params.token);
+      if (!sessao) {
+        return res.status(404).json({ ok: false, mensagem: 'Sessão não encontrada. Escaneie o QR da mesa de novo.' });
+      }
+      await db.touchMenuSession(sessao.token);
+      const { categorias, produtos } = await montarCardapio(sessao.business_id);
+      res.json({
+        ok: true,
+        sessao_token: sessao.token,
+        mesa_id: sessao.mesa_id,
+        categorias,
+        produtos
+      });
+    } catch (e) { next(e); }
+  });
+
+  // ---- carrinho ----
+
+  async function carrinhoResposta(sessao) {
+    const itens = await db.listCartItems(sessao.business_id, sessao.id);
+    const total = Math.round(itens.reduce((t, i) => t + i.subtotal, 0) * 100) / 100;
+    return { ok: true, itens, total };
   }
+
+  // Resolve a sessão a partir do token da URL; os dados de tenant vêm dela.
+  async function exigirSessao(req, res, next) {
+    try {
+      const sessao = await db.findMenuSessionByToken(req.params.token);
+      if (!sessao) {
+        return res.status(404).json({ ok: false, mensagem: 'Sessão não encontrada. Escaneie o QR da mesa de novo.' });
+      }
+      req.sessao = sessao;
+      next();
+    } catch (e) { next(e); }
+  }
+
+  function lerQuantidade(v) {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 0 && n <= 50 ? n : null;
+  }
+
+  router.get('/sessao/:token/carrinho', exigirSessao, async (req, res, next) => {
+    try { res.json(await carrinhoResposta(req.sessao)); } catch (e) { next(e); }
+  });
+
+  router.post('/sessao/:token/carrinho', exigirSessao, async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const { produto_id, observacao } = body;
+      const quantidade = lerQuantidade(body.quantidade === undefined ? 1 : body.quantidade);
+      if (!produto_id || typeof produto_id !== 'string') {
+        return res.status(400).json({ ok: false, mensagem: 'Informe o prato (produto_id).' });
+      }
+      if (!quantidade || quantidade < 1) {
+        return res.status(400).json({ ok: false, mensagem: 'Quantidade inválida (1 a 50).' });
+      }
+      const obs = typeof observacao === 'string' ? observacao.trim().slice(0, 200) : '';
+      const sessao = req.sessao;
+      // UUID malformado não pode virar erro 500 do Postgres.
+      if (!/^[0-9a-f-]{36}$/i.test(produto_id)) {
+        return res.status(404).json({ ok: false, mensagem: 'Prato não encontrado.' });
+      }
+      const produto = await db.getMenuProductById(sessao.business_id, produto_id);
+      if (!produto) return res.status(404).json({ ok: false, mensagem: 'Prato não encontrado.' });
+      if (!produto.disponivel) return res.status(409).json({ ok: false, mensagem: 'Esse prato está indisponível no momento.' });
+      await db.addCartItem(sessao.business_id, sessao.id, { productId: produto.id, quantidade, observacao: obs });
+      await db.touchMenuSession(sessao.token);
+      res.json(await carrinhoResposta(sessao));
+    } catch (e) { next(e); }
+  });
+
+  router.patch('/sessao/:token/carrinho/:itemId', exigirSessao, async (req, res, next) => {
+    try {
+      const quantidade = lerQuantidade(req.body && req.body.quantidade);
+      if (quantidade === null) return res.status(400).json({ ok: false, mensagem: 'Quantidade inválida (0 a 50).' });
+      if (!/^[0-9a-f-]{36}$/i.test(req.params.itemId)) {
+        return res.status(404).json({ ok: false, mensagem: 'Item não encontrado.' });
+      }
+      const sessao = req.sessao;
+      const achou = quantidade === 0
+        ? await db.removeCartItem(sessao.business_id, sessao.id, req.params.itemId)
+        : await db.setCartItemQuantity(sessao.business_id, sessao.id, req.params.itemId, quantidade);
+      if (!achou) return res.status(404).json({ ok: false, mensagem: 'Item não encontrado.' });
+      res.json(await carrinhoResposta(sessao));
+    } catch (e) { next(e); }
+  });
+
+  router.delete('/sessao/:token/carrinho/:itemId', exigirSessao, async (req, res, next) => {
+    try {
+      if (!/^[0-9a-f-]{36}$/i.test(req.params.itemId)) {
+        return res.status(404).json({ ok: false, mensagem: 'Item não encontrado.' });
+      }
+      const sessao = req.sessao;
+      const achou = await db.removeCartItem(sessao.business_id, sessao.id, req.params.itemId);
+      if (!achou) return res.status(404).json({ ok: false, mensagem: 'Item não encontrado.' });
+      res.json(await carrinhoResposta(sessao));
+    } catch (e) { next(e); }
+  });
+
+  // ---- pedido ----
+
+  router.post('/sessao/:token/pedido', exigirSessao, async (req, res, next) => {
+    try {
+      const body = req.body || {};
+      const obs = typeof body.observacao === 'string' ? body.observacao.trim().slice(0, 300) : '';
+      const sessao = req.sessao;
+      const r = await db.createOrderFromCart(sessao.business_id, sessao.id, obs);
+      if (r.erro === 'vazio') return res.status(400).json({ ok: false, mensagem: 'Seu carrinho está vazio.' });
+      if (r.erro === 'mesa_inativa') return res.status(403).json({ ok: false, mensagem: 'Esta mesa não está mais ativa. Chame o atendimento.' });
+      if (r.erro === 'indisponiveis') {
+        return res.status(409).json({ ok: false, mensagem: 'Alguns pratos ficaram indisponíveis: ' + r.itens.join(', ') + '. Remova-os do carrinho para continuar.', itens: r.itens });
+      }
+      await db.touchMenuSession(sessao.token);
+      res.status(201).json({ ok: true, pedido: r.pedido });
+    } catch (e) { next(e); }
+  });
+
+  router.get('/sessao/:token/pedidos', exigirSessao, async (req, res, next) => {
+    try {
+      const pedidos = await db.listOrders(req.sessao.business_id, req.sessao.id, 'session');
+      res.json({ ok: true, pedidos });
+    } catch (e) { next(e); }
+  });
+
+  return router;
 };
