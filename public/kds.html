@@ -193,7 +193,7 @@ function elPedido(p){
   if (proximo) botoes.push('<button class="avancar" data-id="' + p.id + '" data-status="' + proximo + '">' + ROTULO[p.status] + '</button>');
   if (p.status !== 'entregue' && p.status !== 'cancelado') botoes.push('<button class="cancelar" data-id="' + p.id + '" data-status="cancelado">cancelar</button>');
   div.innerHTML =
-    '<div class="topo"><span class="numero">#' + p.numero + '</span><span class="mesa">' + escapeHtml(p.mesa_nome) + '</span></div>' +
+    '<div class="topo"><span class="numero">#' + p.numero + '</span><span class="mesa">' + escapeHtml(p.mesa_nome) + ' · comanda ' + escapeHtml(p.comanda_numero) + '</span></div>' +
     '<ul>' + itens + '</ul>' +
     (p.observacao ? '<div class="obs">' + escapeHtml(p.observacao) + '</div>' : '') +
     '<div class="total">R$ ' + p.total.toFixed(2).replace('.', ',') + '</div>' +
