@@ -115,7 +115,8 @@ module.exports = function createMenuRouter({ db }) {
       if (!sessao.comanda_id) {
         return res.json({ ok: true, sessao_token: sessao.token, mesa_id: sessao.mesa_id, precisa_comanda: true });
       }
-      res.json(await comandaResposta(sessao, null));
+      const comanda = await db.getComandaById(sessao.business_id, sessao.comanda_id);
+      res.json(await comandaResposta(sessao, comanda ? comanda.numero : null));
     } catch (e) { next(e); }
   });
 
