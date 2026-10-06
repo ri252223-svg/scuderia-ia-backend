@@ -343,19 +343,70 @@ function planoAR(p){
   const num = v => typeof v === 'number' && v > 0;
   const L = p.largura_cm, A = p.altura_cm, P = p.profundidade_cm;
   const horiz = [L, P].filter(num);
+  const base = { L: num(L) ? L : null, A: num(A) ? A : null, P: num(P) ? P : null };
   if (num(A) && horiz.length) {
     const maior = Math.max(...horiz);
     const w = num(L) ? L : P;
-    if (A < 0.3 * maior) return { tipo: 'deitado', w, h: num(P) ? P : L };
-    return { tipo: 'em-pe', w, h: A };
+    if (A < 0.3 * maior) return Object.assign({ tipo: 'deitado', w, h: num(P) ? P : L, espessura: A }, base);
+    return Object.assign({ tipo: 'em-pe', w, h: A, espessura: null }, base);
   }
-  if (num(L) && num(P)) return { tipo: 'deitado', w: L, h: P };
+  if (num(L) && num(P)) return Object.assign({ tipo: 'deitado', w: L, h: P, espessura: null }, base);
   return null;
 }
 
 /* GLB-BEGIN */
-/* Monta um arquivo 3D (.glb) mínimo: um retângulo com a foto, no tamanho real em metros.
-   A foto é recortada (sem esticar) pra preencher exatamente o retângulo. */
+/* Empacota geometria + a foto (JPEG) num arquivo 3D (.glb). Material "sem luz" pra a foto
+   aparecer como foi tirada. */
+function empacotarGlb(pos, nor, uv, idx, jpeg){
+  const nv = pos.length / 3, grande = nv > 65535, ib = grande ? 4 : 2;
+  const offN = nv * 12, offU = nv * 24, offI = nv * 32;
+  const offImg = (offI + idx.length * ib + 3) & ~3;
+  const n = jpeg.length, binLen = (offImg + n + 3) & ~3;
+  const bin = new ArrayBuffer(binLen), dv = new DataView(bin);
+  pos.forEach((v,i) => dv.setFloat32(i*4, v, true));
+  nor.forEach((v,i) => dv.setFloat32(offN + i*4, v, true));
+  uv.forEach((v,i) => dv.setFloat32(offU + i*4, v, true));
+  idx.forEach((v,i) => { if (grande) dv.setUint32(offI + i*4, v, true); else dv.setUint16(offI + i*2, v, true); });
+  new Uint8Array(bin, offImg, n).set(jpeg);
+  const mm = (a, k) => [0,1,2].map(c => { let m = k ? -Infinity : Infinity; for (let i = c; i < a.length; i += 3) m = k ? Math.max(m, a[i]) : Math.min(m, a[i]); return m; });
+  const json = {
+    asset: { version: '2.0', generator: 'siky-menu' },
+    extensionsUsed: ['KHR_materials_unlit'],
+    scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
+    meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, indices: 3, material: 0 }] }],
+    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 1 },
+                  doubleSided: true, extensions: { KHR_materials_unlit: {} } }],
+    textures: [{ source: 0 }],
+    images: [{ bufferView: 4, mimeType: 'image/jpeg' }],
+    accessors: [
+      { bufferView: 0, componentType: 5126, count: nv, type: 'VEC3', min: mm(pos, 0), max: mm(pos, 1) },
+      { bufferView: 1, componentType: 5126, count: nv, type: 'VEC3' },
+      { bufferView: 2, componentType: 5126, count: nv, type: 'VEC2' },
+      { bufferView: 3, componentType: grande ? 5125 : 5123, count: idx.length, type: 'SCALAR' }
+    ],
+    bufferViews: [
+      { buffer: 0, byteOffset: 0, byteLength: nv * 12, target: 34962 },
+      { buffer: 0, byteOffset: offN, byteLength: nv * 12, target: 34962 },
+      { buffer: 0, byteOffset: offU, byteLength: nv * 8, target: 34962 },
+      { buffer: 0, byteOffset: offI, byteLength: idx.length * ib, target: 34963 },
+      { buffer: 0, byteOffset: offImg, byteLength: n }
+    ],
+    buffers: [{ byteLength: binLen }]
+  };
+  const js = new TextEncoder().encode(JSON.stringify(json));
+  const jsLen = (js.length + 3) & ~3;
+  const jsPad = new Uint8Array(jsLen).fill(0x20); jsPad.set(js);
+  const total = 12 + 8 + jsLen + 8 + binLen;
+  const out = new ArrayBuffer(total), od = new DataView(out), ob = new Uint8Array(out);
+  od.setUint32(0, 0x46546C67, true); od.setUint32(4, 2, true); od.setUint32(8, total, true);
+  od.setUint32(12, jsLen, true); od.setUint32(16, 0x4E4F534A, true); ob.set(jsPad, 20);
+  od.setUint32(20 + jsLen, binLen, true); od.setUint32(24 + jsLen, 0x004E4942, true);
+  ob.set(new Uint8Array(bin), 28 + jsLen);
+  return ob;
+}
+
+/* "Cartão": retângulo com a foto no tamanho real (em pé ou deitado). A foto é recortada,
+   sem esticar, pra preencher o retângulo. */
 function buildGlb(o){
   const w = o.larguraM, h = o.alturaM;
   const aq = w / h, at = o.imgW / o.imgH;
@@ -372,51 +423,175 @@ function buildGlb(o){
     pos = [-w/2,y,h/2,  w/2,y,h/2,  w/2,y,-h/2,  -w/2,y,-h/2];
     nor = [0,1,0, 0,1,0, 0,1,0, 0,1,0];
   }
-  const uv = [u0,v1, u1,v1, u1,v0, u0,v0];
-  const idx = [0,1,2, 0,2,3];
-  const jpeg = o.jpeg, n = jpeg.length;
-  const binLen = (140 + n + 3) & ~3;
-  const bin = new ArrayBuffer(binLen), dv = new DataView(bin);
-  pos.forEach((v,i) => dv.setFloat32(i*4, v, true));
-  nor.forEach((v,i) => dv.setFloat32(48 + i*4, v, true));
-  uv.forEach((v,i) => dv.setFloat32(96 + i*4, v, true));
-  idx.forEach((v,i) => dv.setUint16(128 + i*2, v, true));
-  new Uint8Array(bin, 140, n).set(jpeg);
-  const mm = (a, k) => [0,1,2].map(c => { const xs = a.filter((_, i) => i % 3 === c); return k ? Math.max(...xs) : Math.min(...xs); });
-  const json = {
-    asset: { version: '2.0', generator: 'siky-menu' },
-    extensionsUsed: ['KHR_materials_unlit'],
-    scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
-    meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, indices: 3, material: 0 }] }],
-    materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 1 },
-                  doubleSided: true, extensions: { KHR_materials_unlit: {} } }],
-    textures: [{ source: 0 }],
-    images: [{ bufferView: 4, mimeType: 'image/jpeg' }],
-    accessors: [
-      { bufferView: 0, componentType: 5126, count: 4, type: 'VEC3', min: mm(pos, 0), max: mm(pos, 1) },
-      { bufferView: 1, componentType: 5126, count: 4, type: 'VEC3' },
-      { bufferView: 2, componentType: 5126, count: 4, type: 'VEC2' },
-      { bufferView: 3, componentType: 5123, count: 6, type: 'SCALAR' }
-    ],
-    bufferViews: [
-      { buffer: 0, byteOffset: 0, byteLength: 48, target: 34962 },
-      { buffer: 0, byteOffset: 48, byteLength: 48, target: 34962 },
-      { buffer: 0, byteOffset: 96, byteLength: 32, target: 34962 },
-      { buffer: 0, byteOffset: 128, byteLength: 12, target: 34963 },
-      { buffer: 0, byteOffset: 140, byteLength: n }
-    ],
-    buffers: [{ byteLength: binLen }]
+  return empacotarGlb(pos, nor, [u0,v1, u1,v1, u1,v0, u0,v0], [0,1,2, 0,2,3], o.jpeg);
+}
+
+/* Acha o contorno do prato numa foto de fundo liso. Devolve o "perfil" (raio de cada linha)
+   ou { ok:false, motivo } quando o fundo não é liso o bastante pra recortar com segurança. */
+function analisarSilhueta(d, w, h){
+  const R = [], G = [], B = [];
+  const add = (x, y) => { const i = (y*w + x) * 4; R.push(d[i]); G.push(d[i+1]); B.push(d[i+2]); };
+  for (let x = 0; x < w; x++) { add(x,0); add(x,1); add(x,h-2); add(x,h-1); }
+  for (let y = 2; y < h-2; y++) { add(0,y); add(1,y); add(w-2,y); add(w-1,y); }
+  const med = (a) => { const s = a.slice().sort((p,q) => p-q); return s[s.length >> 1]; };
+  const bg = [med(R), med(G), med(B)];
+  let dev = 0;
+  for (let i = 0; i < R.length; i++) dev += Math.abs(R[i]-bg[0]) + Math.abs(G[i]-bg[1]) + Math.abs(B[i]-bg[2]);
+  dev /= R.length * 3;
+  if (dev > 14) return { ok: false, motivo: 'fundo-irregular' };
+  const fg = (x, y) => { const i = (y*w + x) * 4; return Math.abs(d[i]-bg[0]) + Math.abs(d[i+1]-bg[1]) + Math.abs(d[i+2]-bg[2]) > 80; };
+  const esq = new Array(h).fill(-1), dir = new Array(h).fill(-1);
+  let area = 0, sr = 0, sg = 0, sb = 0, minL = w, maxR = -1, top = -1, bottom = -1;
+  for (let y = 0; y < h; y++) {
+    let l = -1, r = -1;
+    for (let x = 0; x < w; x++) {
+      if (!fg(x, y)) continue;
+      const i = (y*w + x) * 4; area++; sr += d[i]; sg += d[i+1]; sb += d[i+2];
+      if (x < w-1 && fg(x+1, y)) { if (l < 0) l = x; r = x + 1; }
+    }
+    if (l >= 0) { esq[y] = l; dir[y] = r; minL = Math.min(minL, l); maxR = Math.max(maxR, r); if (top < 0) top = y; bottom = y; }
+  }
+  if (area < 0.04 * w * h || area > 0.85 * w * h || top < 0) return { ok: false, motivo: 'sem-objeto' };
+  if (bottom - top + 1 < 0.25 * h) return { ok: false, motivo: 'objeto-pequeno' };
+  if ((minL <= 1 && maxR >= w-2) || (top <= 1 && bottom >= h-2)) return { ok: false, motivo: 'recortada' };
+  const cx = (minL + maxR) / 2;
+  let r = [], cs = [], ult = 1, cult = cx;
+  for (let y = top; y <= bottom; y++) {
+    if (esq[y] >= 0) { ult = Math.max(1, (dir[y] - esq[y]) / 2); cult = (esq[y] + dir[y]) / 2; }
+    r.push(ult); cs.push(cult);
+  }
+  const suave = (a) => { let b = a; for (let pass = 0; pass < 2; pass++) b = b.map((_, i) => { let t = 0, c = 0; for (let k = -2; k <= 2; k++) { const j = i + k; if (j >= 0 && j < b.length) { t += b[j]; c++; } } return t / c; }); return b; };
+  r = suave(r); cs = suave(cs);
+  return { ok: true, cx, top, bottom, radii: r, centros: cs, cor: [sr/area, sg/area, sb/area], larguraPx: 2 * Math.max(...r) };
+}
+
+/* Cor média do "anel" externo do círculo central da foto (a borda do prato visto de cima). */
+function corAnel(d, w, h){
+  const R = Math.min(w, h) / 2, cx = w / 2, cy = h / 2;
+  let sr = 0, sg = 0, sb = 0, n = 0;
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const q = Math.hypot(x - cx, y - cy) / R;
+    if (q >= 0.78 && q <= 0.95) { const i = (y*w + x) * 4; sr += d[i]; sg += d[i+1]; sb += d[i+2]; n++; }
+  }
+  return n ? [sr/n, sg/n, sb/n] : [128, 128, 128];
+}
+
+/* Escolhe o tipo de modelo. Só usa medidas do dono. Sem condição segura, fica o "cartão". */
+function decidirModelo(plano, d, w, h){
+  const media = (a, b) => (a && b) ? (a + b) / 2 : (a || b);
+  if (plano.tipo === 'em-pe') {
+    const s = analisarSilhueta(d, w, h);
+    if (s.ok) return { tipo: 'revolucao', sil: s, tira: s.cor, diametroCm: media(plano.L, plano.P), alturaCm: plano.A };
+    return { tipo: 'cartao', tipoCartao: 'em-pe', wCm: plano.w, hCm: plano.h, motivo: s.motivo };
+  }
+  if (plano.espessura) {
+    const L = plano.w, P = plano.h, tira = corAnel(d, w, h);
+    if (Math.abs(L - P) <= 0.15 * Math.max(L, P)) return { tipo: 'disco', diametroCm: (L + P) / 2, alturaCm: plano.espessura, tira };
+    return { tipo: 'caixa', larguraCm: L, profundidadeCm: P, alturaCm: plano.espessura, tira };
+  }
+  return { tipo: 'cartao', tipoCartao: 'deitado', wCm: plano.w, hCm: plano.h };
+}
+
+/* Sólido de revolução: gira o perfil do contorno em volta do eixo vertical. A foto é "projetada"
+   pela frente (e por trás), então a frente fica igual à foto. */
+function solidoRevolucao(o){
+  const N = 36, K = 48, rad = o.radiosPx, len = rad.length;
+  const sx = (o.diametroM / 2) / Math.max(...rad), A = o.alturaM;
+  const interp = (a, t) => { const f = t * (len - 1), i0 = Math.floor(f), i1 = Math.min(len - 1, i0 + 1); return a[i0] + (a[i1] - a[i0]) * (f - i0); };
+  const rows = [], cent = [];
+  for (let i = 0; i < N; i++) { rows.push(interp(rad, i / (N - 1))); cent.push(o.centrosPx ? interp(o.centrosPx, i / (N - 1)) : o.cxPx); }
+  const REC = 0.97; // recua um pouco da borda da foto, pra não pegar pixel misturado com o fundo
+  const pos = [], nor = [], uv = [], idx = [];
+  const dy = A / (N - 1);
+  const vDe = (t) => (o.topoPx + t * (len - 1) + 0.5) / o.texH;
+  for (let i = 0; i < N; i++) {
+    const t = i / (N - 1), r = rows[i], rm = r * sx, y = A * (1 - t);
+    const rPrev = rows[Math.max(0, i - 1)], rNext = rows[Math.min(N - 1, i + 1)];
+    const drdy = (rPrev - rNext) * sx / (Math.max(0, i - 1) === Math.min(N - 1, i + 1) ? 1 : (Math.min(N - 1, i + 1) - Math.max(0, i - 1)) * dy);
+    for (let k = 0; k <= K; k++) {
+      const th = 2 * Math.PI * k / K, c = Math.cos(th), s = Math.sin(th);
+      pos.push(rm * c, y, rm * s);
+      const l = Math.hypot(c, drdy, s); nor.push(c / l, -drdy / l, s / l);
+      uv.push((cent[i] + r * REC * c) / o.imgW, vDe(t));
+    }
+  }
+  for (let i = 0; i < N - 1; i++) for (let k = 0; k < K; k++) {
+    const a = i * (K + 1) + k, b = a + 1, c2 = a + (K + 1), d2 = c2 + 1;
+    idx.push(a, b, c2, b, d2, c2);
+  }
+  const tiraV = (o.photoH + 4) / o.texH;
+  const capa = (linha, y, ny, topo) => {
+    const centro = pos.length / 3, r = rows[linha] * sx;
+    pos.push(0, y, 0); nor.push(0, ny, 0);
+    uv.push(topo ? cent[linha] / o.imgW : 0.5, topo ? vDe(linha / (N - 1)) : tiraV);
+    for (let k = 0; k <= K; k++) {
+      const th = 2 * Math.PI * k / K, c = Math.cos(th), s = Math.sin(th);
+      pos.push(r * c, y, r * s); nor.push(0, ny, 0);
+      uv.push(topo ? (cent[linha] + rows[linha] * REC * c) / o.imgW : 0.5, topo ? vDe(linha / (N - 1)) : tiraV);
+    }
+    for (let k = 0; k < K; k++) { if (topo) idx.push(centro, centro + k + 2, centro + k + 1); else idx.push(centro, centro + k + 1, centro + k + 2); }
   };
-  let js = new TextEncoder().encode(JSON.stringify(json));
-  const jsLen = (js.length + 3) & ~3;
-  const jsPad = new Uint8Array(jsLen).fill(0x20); jsPad.set(js);
-  const total = 12 + 8 + jsLen + 8 + binLen;
-  const out = new ArrayBuffer(total), od = new DataView(out), ob = new Uint8Array(out);
-  od.setUint32(0, 0x46546C67, true); od.setUint32(4, 2, true); od.setUint32(8, total, true);
-  od.setUint32(12, jsLen, true); od.setUint32(16, 0x4E4F534A, true); ob.set(jsPad, 20);
-  od.setUint32(20 + jsLen, binLen, true); od.setUint32(24 + jsLen, 0x004E4942, true);
-  ob.set(new Uint8Array(bin), 28 + jsLen);
-  return ob;
+  capa(0, A, 1, true);
+  capa(N - 1, 0, -1, false);
+  return { pos, nor, uv, idx };
+}
+
+/* Disco: prato/pizza vistos de cima. Foto na tampa; lateral e fundo com a cor da borda. */
+function discoSolido(o){
+  const K = 64, R = o.diametroM / 2, A = o.alturaM;
+  const kk = 0.47 * Math.min(o.imgW, o.photoH), tiraV = (o.photoH + 4) / o.texH;
+  const pos = [], nor = [], uv = [], idx = [];
+  pos.push(0, A, 0); nor.push(0, 1, 0); uv.push(0.5, (o.photoH / 2) / o.texH);
+  for (let k = 0; k <= K; k++) {
+    const th = 2 * Math.PI * k / K, c = Math.cos(th), s = Math.sin(th);
+    pos.push(R * c, A, R * s); nor.push(0, 1, 0);
+    uv.push((o.imgW / 2 + c * kk) / o.imgW, (o.photoH / 2 + s * kk) / o.texH);
+  }
+  for (let k = 0; k < K; k++) idx.push(0, k + 2, k + 1);
+  const l0 = pos.length / 3;
+  for (let k = 0; k <= K; k++) {
+    const th = 2 * Math.PI * k / K, c = Math.cos(th), s = Math.sin(th);
+    pos.push(R * c, A, R * s); nor.push(c, 0, s); uv.push(0.5, tiraV);
+    pos.push(R * c, 0, R * s); nor.push(c, 0, s); uv.push(0.5, tiraV);
+  }
+  for (let k = 0; k < K; k++) { const a = l0 + k * 2, b = a + 1, c2 = a + 2, d2 = a + 3; idx.push(a, c2, b, c2, d2, b); }
+  const b0 = pos.length / 3;
+  pos.push(0, 0, 0); nor.push(0, -1, 0); uv.push(0.5, tiraV);
+  for (let k = 0; k <= K; k++) {
+    const th = 2 * Math.PI * k / K;
+    pos.push(R * Math.cos(th), 0, R * Math.sin(th)); nor.push(0, -1, 0); uv.push(0.5, tiraV);
+  }
+  for (let k = 0; k < K; k++) idx.push(b0, b0 + k + 1, b0 + k + 2);
+  return { pos, nor, uv, idx };
+}
+
+/* Caixa: prato retangular visto de cima, com espessura. */
+function caixaSolida(o){
+  const W = o.larguraM, D = o.profundidadeM, A = o.alturaM;
+  const tiraV = (o.photoH + 4) / o.texH, aq = W / D, at = o.imgW / o.photoH;
+  let u0 = 0, u1 = 1, v0 = 0, v1 = 1;
+  if (at > aq) { const c = (1 - aq / at) / 2; u0 = c; u1 = 1 - c; } else { const c = (1 - at / aq) / 2; v0 = c; v1 = 1 - c; }
+  const k = o.photoH / o.texH, pos = [], nor = [], uv = [], idx = [];
+  const quad = (p, n, t) => { const b = pos.length / 3; p.forEach(q => { pos.push(...q); nor.push(...n); }); t.forEach(q => uv.push(...q)); idx.push(b, b+1, b+2, b, b+2, b+3); };
+  const tira = [[0.5, tiraV], [0.5, tiraV], [0.5, tiraV], [0.5, tiraV]];
+  quad([[-W/2,A,D/2],[W/2,A,D/2],[W/2,A,-D/2],[-W/2,A,-D/2]], [0,1,0], [[u0,v1*k],[u1,v1*k],[u1,v0*k],[u0,v0*k]]);
+  quad([[-W/2,0,D/2],[W/2,0,D/2],[W/2,A,D/2],[-W/2,A,D/2]], [0,0,1], tira);
+  quad([[W/2,0,-D/2],[-W/2,0,-D/2],[-W/2,A,-D/2],[W/2,A,-D/2]], [0,0,-1], tira);
+  quad([[W/2,0,D/2],[W/2,0,-D/2],[W/2,A,-D/2],[W/2,A,D/2]], [1,0,0], tira);
+  quad([[-W/2,0,-D/2],[-W/2,0,D/2],[-W/2,A,D/2],[-W/2,A,-D/2]], [-1,0,0], tira);
+  quad([[-W/2,0,-D/2],[W/2,0,-D/2],[W/2,0,D/2],[-W/2,0,D/2]], [0,-1,0], tira);
+  return { pos, nor, uv, idx };
+}
+
+/* Monta o arquivo 3D conforme a decisão. w/h = tamanho da foto; texH = altura da imagem enviada
+   (a foto + uma tira de cor sólida embaixo, usada na lateral/fundo dos sólidos). */
+function construirModelo(dec, w, h, texH, jpeg){
+  if (dec.tipo === 'cartao') return buildGlb({ tipo: dec.tipoCartao, larguraM: dec.wCm / 100, alturaM: dec.hCm / 100, jpeg, imgW: w, imgH: h });
+  let g;
+  if (dec.tipo === 'revolucao') g = solidoRevolucao({ radiosPx: dec.sil.radii, centrosPx: dec.sil.centros, cxPx: dec.sil.cx, topoPx: dec.sil.top, imgW: w, photoH: h, texH, diametroM: dec.diametroCm / 100, alturaM: dec.alturaCm / 100 });
+  else if (dec.tipo === 'disco') g = discoSolido({ diametroM: dec.diametroCm / 100, alturaM: dec.alturaCm / 100, imgW: w, photoH: h, texH });
+  else g = caixaSolida({ larguraM: dec.larguraCm / 100, profundidadeM: dec.profundidadeCm / 100, alturaM: dec.alturaCm / 100, imgW: w, photoH: h, texH });
+  return empacotarGlb(g.pos, g.nor, g.uv, g.idx, jpeg);
 }
 /* GLB-END */
 
@@ -430,21 +605,33 @@ function carregarImagem(src){
     im.src = src;
   });
 }
-async function prepararImagem(src){
+async function lerFoto(src){
   const im = await carregarImagem(src);
   const k = Math.min(1, 1024 / Math.max(im.naturalWidth, im.naturalHeight));
   const w = Math.max(1, Math.round(im.naturalWidth * k)), h = Math.max(1, Math.round(im.naturalHeight * k));
   const c = document.createElement('canvas'); c.width = w; c.height = h;
   const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, w, h); ctx.drawImage(im, 0, 0, w, h);
+  return { im, w, h, data: ctx.getImageData(0, 0, w, h).data };
+}
+/* Gera o JPEG da textura. Com "tira", acrescenta 8px de cor sólida embaixo da foto. */
+async function jpegDaFoto(foto, tira){
+  const extra = tira ? 8 : 0, texH = foto.h + extra;
+  const c = document.createElement('canvas'); c.width = foto.w; c.height = texH;
+  const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, foto.w, texH);
+  ctx.drawImage(foto.im, 0, 0, foto.w, foto.h);
+  if (tira) { ctx.fillStyle = 'rgb(' + tira.map(v => Math.round(v)).join(',') + ')'; ctx.fillRect(0, foto.h, foto.w, extra); }
   const blob = await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(new Error('blob')), 'image/jpeg', 0.88));
-  return { bytes: new Uint8Array(await blob.arrayBuffer()), w, h };
+  return { bytes: new Uint8Array(await blob.arrayBuffer()), texH };
 }
 let mvPromise = null;
 function carregarModelViewer(){
   if (window.customElements && customElements.get('model-viewer')) return Promise.resolve();
   if (!mvPromise) mvPromise = new Promise((res, rej) => {
+    const falha = () => { mvPromise = null; rej(new Error('mv')); };
+    const t = setTimeout(falha, window.__MV_TIMEOUT_MS || 20000);
     const s = document.createElement('script'); s.type = 'module'; s.src = MODEL_VIEWER_URL;
-    s.onload = () => res(); s.onerror = () => { mvPromise = null; rej(new Error('mv')); };
+    s.onload = () => customElements.whenDefined('model-viewer').then(() => { clearTimeout(t); res(); });
+    s.onerror = () => { clearTimeout(t); falha(); };
     document.head.appendChild(s);
   });
   return mvPromise;
@@ -458,9 +645,16 @@ async function abrirAR(p){
   const stage = $('ar-stage');
   stage.innerHTML = '<div class="vazio">Preparando a visualização...</div>';
   $('ar-overlay').classList.remove('hidden');
+  const falhou = (motivo) => { stage.innerHTML = '<div class="vazio">Não foi possível preparar a visualização em AR: ' + motivo + '</div>'; };
+  let foto, dec, jpg;
+  try { foto = await lerFoto(p.foto); }
+  catch (e) { return falhou('não consegui carregar a foto deste prato. Se a foto vem de outro site, ele pode ter bloqueado o uso.'); }
+  try { await carregarModelViewer(); }
+  catch (e) { return falhou('não consegui carregar o visualizador 3D. Confira a internet e tente de novo.'); }
   try {
-    const [img] = await Promise.all([prepararImagem(p.foto), carregarModelViewer()]);
-    const glb = buildGlb({ tipo: plano.tipo, larguraM: plano.w / 100, alturaM: plano.h / 100, jpeg: img.bytes, imgW: img.w, imgH: img.h });
+    dec = decidirModelo(plano, foto.data, foto.w, foto.h);
+    jpg = await jpegDaFoto(foto, dec.tira || null);
+    const glb = construirModelo(dec, foto.w, foto.h, jpg.texH, jpg.bytes);
     if (arUrl) URL.revokeObjectURL(arUrl);
     arUrl = URL.createObjectURL(new Blob([glb], { type: 'model/gltf-binary' }));
     const mv = document.createElement('model-viewer');
@@ -474,8 +668,9 @@ async function abrirAR(p){
     mv.addEventListener('load', () => {
       if (mv.canActivateAR === false) $('ar-legenda').textContent = 'Este celular ou navegador não abre a câmera AR. Aqui você só gira a imagem. Tamanho real: ' + tamanho(p) + '.';
     });
+    mv.addEventListener('error', () => falhou('o visualizador não conseguiu abrir o modelo 3D.'));
   } catch (e) {
-    stage.innerHTML = '<div class="vazio">Não foi possível preparar a visualização em AR agora.</div>';
+    falhou('não foi possível montar o modelo 3D deste prato.');
   }
 }
 function fecharAR(){
