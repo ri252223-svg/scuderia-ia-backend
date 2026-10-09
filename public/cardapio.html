@@ -355,9 +355,10 @@ function planoAR(p){
 }
 
 /* GLB-BEGIN */
-/* Empacota geometria + a foto (JPEG) num arquivo 3D (.glb). Material "sem luz" pra a foto
-   aparecer como foi tirada. */
-function empacotarGlb(pos, nor, uv, idx, jpeg){
+/* Empacota geometria + a foto (JPEG) num arquivo 3D (.glb). Usa o material PBR padrão de propósito:
+   o iPhone converte o modelo pra USDZ e esse conversor IGNORA qualquer outro tipo de material
+   (ex.: "unlit"), deixando o AR vazio. */
+function empacotarGlb(pos, nor, uv, idx, jpeg, duplaFace){
   const nv = pos.length / 3, grande = nv > 65535, ib = grande ? 4 : 2;
   const offN = nv * 12, offU = nv * 24, offI = nv * 32;
   const offImg = (offI + idx.length * ib + 3) & ~3;
@@ -371,11 +372,10 @@ function empacotarGlb(pos, nor, uv, idx, jpeg){
   const mm = (a, k) => [0,1,2].map(c => { let m = k ? -Infinity : Infinity; for (let i = c; i < a.length; i += 3) m = k ? Math.max(m, a[i]) : Math.min(m, a[i]); return m; });
   const json = {
     asset: { version: '2.0', generator: 'siky-menu' },
-    extensionsUsed: ['KHR_materials_unlit'],
     scene: 0, scenes: [{ nodes: [0] }], nodes: [{ mesh: 0 }],
     meshes: [{ primitives: [{ attributes: { POSITION: 0, NORMAL: 1, TEXCOORD_0: 2 }, indices: 3, material: 0 }] }],
     materials: [{ pbrMetallicRoughness: { baseColorTexture: { index: 0 }, metallicFactor: 0, roughnessFactor: 1 },
-                  doubleSided: true, extensions: { KHR_materials_unlit: {} } }],
+                  doubleSided: !!duplaFace }],
     textures: [{ source: 0 }],
     images: [{ bufferView: 4, mimeType: 'image/jpeg' }],
     accessors: [
@@ -423,7 +423,7 @@ function buildGlb(o){
     pos = [-w/2,y,h/2,  w/2,y,h/2,  w/2,y,-h/2,  -w/2,y,-h/2];
     nor = [0,1,0, 0,1,0, 0,1,0, 0,1,0];
   }
-  return empacotarGlb(pos, nor, [u0,v1, u1,v1, u1,v0, u0,v0], [0,1,2, 0,2,3], o.jpeg);
+  return empacotarGlb(pos, nor, [u0,v1, u1,v1, u1,v0, u0,v0], [0,1,2, 0,2,3], o.jpeg, true);
 }
 
 /* Acha o contorno do prato numa foto de fundo liso. Devolve o "perfil" (raio de cada linha)
@@ -591,7 +591,7 @@ function construirModelo(dec, w, h, texH, jpeg){
   if (dec.tipo === 'revolucao') g = solidoRevolucao({ radiosPx: dec.sil.radii, centrosPx: dec.sil.centros, cxPx: dec.sil.cx, topoPx: dec.sil.top, imgW: w, photoH: h, texH, diametroM: dec.diametroCm / 100, alturaM: dec.alturaCm / 100 });
   else if (dec.tipo === 'disco') g = discoSolido({ diametroM: dec.diametroCm / 100, alturaM: dec.alturaCm / 100, imgW: w, photoH: h, texH });
   else g = caixaSolida({ larguraM: dec.larguraCm / 100, profundidadeM: dec.profundidadeCm / 100, alturaM: dec.alturaCm / 100, imgW: w, photoH: h, texH });
-  return empacotarGlb(g.pos, g.nor, g.uv, g.idx, jpeg);
+  return empacotarGlb(g.pos, g.nor, g.uv, g.idx, jpeg, false);
 }
 /* GLB-END */
 
